@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
-
 import { auth, db } from "./firebase";
 
 import {
@@ -12,26 +11,22 @@ import {
 } from "firebase/auth";
 
 import {
+  addDoc,
   collection,
   collectionGroup,
+  deleteDoc,
   doc,
   getDoc,
-  addDoc,
-  getDocs,
   onSnapshot,
-  query,
   orderBy,
+  query,
   serverTimestamp,
+  setDoc,
   updateDoc,
+  where,
 } from "firebase/firestore";
 
-// ------------------------------------
-// INITIAL DATA
-// ------------------------------------
-
-const initialQueries = [];
-
-const categories = [
+const DEFAULT_CATEGORIES = [
   "Scholarship",
   "Financial Assistance",
   "Education",
@@ -40,145 +35,157 @@ const categories = [
   "Other",
 ];
 
-// ------------------------------------
-// ERROR MESSAGES
-// ------------------------------------
+const ROLE_LABELS = {
+  student: "Student Representative",
+  coordinator: "Coordinator",
+  admin: "Admin",
+};
+
+const STATUSES = ["Pending", "In Progress", "Resolved"];
 
 function getErrorMessage(error) {
-  const messages = {
+  const errors = {
     "auth/email-already-in-use":
       "This email already has an account. Please sign in.",
-    "auth/invalid-email":
-      "Please enter a valid email address.",
+    "auth/invalid-email": "Enter a valid email address.",
     "auth/weak-password":
-      "Please choose a stronger password.",
+      "Password must contain at least 6 characters.",
     "auth/invalid-credential":
       "Incorrect email or password.",
-    "auth/user-not-found":
-      "No account found with this email.",
-    "auth/wrong-password":
-      "Incorrect password. Please try again.",
     "auth/network-request-failed":
-      "Network error. Check your internet connection.",
-    "auth/too-many-requests":
-      "Too many attempts. Please try again later.",
-    "auth/operation-not-allowed":
-      "Email/Password sign-in is not enabled in Firebase.",
-    "auth/missing-email":
-      "Please enter your email address.",
+      "Check your internet connection.",
+    "permission-denied":
+      "Permission denied. Please check your Firestore security rules.",
+    "failed-precondition":
+      "A Firestore index may be required. Check the Firebase console.",
   };
 
   return (
-    messages[error.code] ||
-    `Something went wrong: ${error.code || error.message}`
+    errors[error.code] ||
+    error.message ||
+    "Something went wrong."
   );
 }
 
-// ------------------------------------
-// MAIN APP
-// ------------------------------------
-
 function App() {
-  const [showSplash, setShowSplash] = useState(true);
-
-  // Authentication
   const [authUser, setAuthUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
-  const [userRole, setUserRole] = useState("student");
+
+  const [role, setRole] = useState("student");
   const [roleReady, setRoleReady] = useState(false);
-  const [isRegistering, setIsRegistering] = useState(false);
+
+  const [registering, setRegistering] = useState(false);
   const [authLoading, setAuthLoading] = useState(false);
 
-  // Navigation
-  const [activePage, setActivePage] = useState("dashboard");
-  const [selectedQueryId, setSelectedQueryId] = useState(null);
-
-  // Login
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
 
-  // Application
-  const [queries, setQueries] = useState(initialQueries);
-  const [queriesLoading, setQueriesLoading] = useState(false);
-  const [search, setSearch] = useState("");
   const [notice, setNotice] = useState("");
+  const [page, setPage] = useState("dashboard");
 
-  // Query form
+  const [queries, setQueries] = useState([]);
+  const [queriesLoading, setQueriesLoading] = useState(false);
+
+  const [selectedQuery, setSelectedQuery] = useState(null);
+  const [search, setSearch] = useState("");
+
   const [form, setForm] = useState({
     title: "",
-    category: "Scholarship",
+    category: DEFAULT_CATEGORIES[0],
     description: "",
   });
 
-  // ------------------------------------
-  // SPLASH SCREEN TIMER
-  // ------------------------------------
+  // Categories are consistently stored as strings.
+  const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
 
-  useEffect(() => {
-    const timer = setTimeout(() => {
-      setShowSplash(false);
-    }, 1800);
+  // Every user object has uid, email, displayName and role.
+  const [users, setUsers] = useState([]);
 
-    return () => clearTimeout(timer);
-  }, []);
+  const [rulesText, setRulesText] = useState("");
+  const [newCategory, setNewCategory] = useState("");
+  const [assignmentUid, setAssignmentUid] = useState("");
 
-  // ------------------------------------
-  // FIREBASE AUTH LISTENER
-  // ------------------------------------
+  // --------------------------------------------------
+  // AUTHENTICATION
+  // --------------------------------------------------
 
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, (user) => {
-      // Reset role loading whenever authentication changes.
-      setRoleReady(false);
       setAuthUser(user);
+      setAuthReady(true);
+      setNotice("");
 
       if (!user) {
-        setUserRole("student");
+        setRole("student");
         setRoleReady(true);
+        setQueries([]);
+        setUsers([]);
+        setCategories(DEFAULT_CATEGORIES);
+        setRulesText("");
+        setSelectedQuery(null);
+        setPage("dashboard");
+        setSearch("");
+      } else {
+        setRoleReady(false);
       }
-
-      setAuthReady(true);
     });
 
     return unsubscribe;
   }, []);
 
-  // ------------------------------------
-  // LOAD SIGNED-IN USER ROLE
-  // ------------------------------------
+  // --------------------------------------------------
+  // LOAD USER ROLE AND PROFILE
+  // --------------------------------------------------
 
   useEffect(() => {
-    if (!authReady || !authUser) return;
+    if (!authUser) return;
 
-    let cancelled = false;
+    let active = true;
 
     async function loadRole() {
       try {
         const roleRef = doc(db, "roles", authUser.uid);
         const roleSnapshot = await getDoc(roleRef);
 
-        const role = roleSnapshot.exists()
-          ? roleSnapshot.data().role
-          : "student";
-
-        if (!cancelled) {
-          setUserRole(
-            role === "coordinator" ? "coordinator" : "student"
+        if (!roleSnapshot.exists()) {
+          throw new Error(
+            "Role document not found. Contact the administrator."
           );
+        }
 
+        const userRole = roleSnapshot.data().role;
+
+        if (!["student", "coordinator", "admin"].includes(userRole)) {
+          throw new Error("Invalid account role.");
+        }
+
+        if (active) {
+          setRole(userRole);
           setRoleReady(true);
         }
-      } catch (error) {
-        console.error("Error loading user role:", error);
 
-        if (!cancelled) {
-          setUserRole("student");
-          setRoleReady(true);
-
-          setNotice(
-            "Unable to verify your account role. Some features may be unavailable."
+        // Update profile without overwriting the role.
+        try {
+          await setDoc(
+            doc(db, "users", authUser.uid),
+            {
+              email: authUser.email || "",
+              displayName:
+                authUser.displayName ||
+                (authUser.email || "").split("@")[0],
+              lastLoginAt: serverTimestamp(),
+            },
+            { merge: true }
           );
+        } catch (profileError) {
+          console.error("Profile update error:", profileError);
+        }
+      } catch (error) {
+        console.error("Role loading error:", error);
+
+        if (active) {
+          setNotice(getErrorMessage(error));
+          setRoleReady(true);
         }
       }
     }
@@ -186,360 +193,564 @@ function App() {
     loadRole();
 
     return () => {
-      cancelled = true;
+      active = false;
     };
-  }, [authReady, authUser]);
+  }, [authUser]);
 
-  // ------------------------------------
-  // LIVE QUERY LOADING
-  // ------------------------------------
+  // --------------------------------------------------
+  // LOAD CATEGORIES
+  // --------------------------------------------------
 
   useEffect(() => {
-    if (!authReady || !authUser || !roleReady) return;
-
-    const queriesRef =
-      userRole === "coordinator"
-        ? collectionGroup(db, "queries")
-        : collection(
-            db,
-            "users",
-            authUser.uid,
-            "queries"
-          );
-
-    const queriesQuery = query(
-      queriesRef,
-      orderBy("createdAt", "desc")
-    );
+    if (!authUser || !roleReady) return;
 
     const unsubscribe = onSnapshot(
-      queriesQuery,
+      collection(db, "categories"),
       (snapshot) => {
-        const loadedQueries = snapshot.docs.map((queryDoc) => {
-          const data = queryDoc.data();
+        if (snapshot.empty) {
+          setCategories(DEFAULT_CATEGORIES);
+          return;
+        }
 
-          const ownerUid =
-            queryDoc.ref.parent.parent?.id || authUser.uid;
+        const values = snapshot.docs
+          .map((item) => item.data().name)
+          .filter(
+            (name) =>
+              typeof name === "string" &&
+              name.trim().length > 0
+          );
 
-          return {
-            id: queryDoc.id,
-            ownerUid,
-            title: data.title || "Untitled query",
-            category: data.category || "Other",
-            description: data.description || "",
-            status: data.status || "Pending",
-
-            date: data.createdAt?.toDate
-              ? data.createdAt.toDate().toLocaleDateString("en-IN")
-              : "Just now",
-
-            student: data.studentEmail || "Student",
-            statusUpdatedAt: data.statusUpdatedAt || null,
-          };
-        });
-
-        setQueries(loadedQueries);
-        setQueriesLoading(false);
+        setCategories(
+          values.length > 0 ? values : DEFAULT_CATEGORIES
+        );
       },
       (error) => {
-        console.error("Error listening to queries:", error);
-
-        setNotice(
-          userRole === "coordinator"
-            ? "Unable to load all student queries. Check Firestore rules and indexes."
-            : "Unable to load your queries. Please refresh."
-        );
-
-        setQueriesLoading(false);
+        console.error("Category loading error:", error);
+        setNotice(getErrorMessage(error));
       }
     );
 
     return unsubscribe;
-  }, [authReady, authUser, roleReady, userRole]);
+  }, [authUser, roleReady]);
 
-  // ------------------------------------
-  // DERIVED DATA
-  // ------------------------------------
+  // --------------------------------------------------
+  // LOAD QUERIES BASED ON ROLE
+  // --------------------------------------------------
 
-  const selectedQuery = useMemo(
-    () =>
-      queries.find(
-        (queryItem) => queryItem.id === selectedQueryId
-      ),
-    [queries, selectedQueryId]
-  );
+  useEffect(() => {
+    if (!authUser || !roleReady) return;
 
-  const pendingCount = queries.filter(
-    (item) => item.status === "Pending"
-  ).length;
+    let active = true;
 
-  const progressCount = queries.filter(
-    (item) => item.status === "In Progress"
-  ).length;
+    const queryCollection =
+      role === "student"
+        ? collection(db, "users", authUser.uid, "queries")
+        : collectionGroup(db, "queries");
 
-  const resolvedCount = queries.filter(
-    (item) => item.status === "Resolved"
-  ).length;
+    const queryConstraints = [];
 
-  const filteredQueries = queries.filter((queryItem) => {
-    const searchText = search.toLowerCase();
+    if (role === "coordinator") {
+      queryConstraints.push(
+        where("assignedTo", "==", authUser.uid)
+      );
+    } else {
+      queryConstraints.push(orderBy("createdAt", "desc"));
+    }
 
-    return (
-      queryItem.title.toLowerCase().includes(searchText) ||
-      queryItem.category.toLowerCase().includes(searchText) ||
-      queryItem.status.toLowerCase().includes(searchText) ||
-      (
-        userRole === "coordinator" &&
-        queryItem.student.toLowerCase().includes(searchText)
-      )
+    const queriesRef = query(
+      queryCollection,
+      ...queryConstraints
     );
-  });
 
-  // ------------------------------------
-  // LOGIN / REGISTER
-  // ------------------------------------
+    const unsubscribe = onSnapshot(
+      queriesRef,
+      (snapshot) => {
+        if (!active) return;
 
-  async function handleLogin(event) {
-    event.preventDefault();
+        const queryList = snapshot.docs.map((item) => {
+          const data = item.data();
 
-    if (!email.trim() || !password) {
-      setNotice("Please enter your email and password.");
+          return {
+            id: item.id,
+            ownerUid:
+              item.ref.parent.parent?.id || authUser.uid,
+            title: data.title || "Untitled Query",
+            category: data.category || "Other",
+            description: data.description || "",
+            status: data.status || "Pending",
+            studentEmail: data.studentEmail || "",
+            assignedTo: data.assignedTo || "",
+            assignedEmail: data.assignedEmail || "",
+            createdAt: data.createdAt || null,
+            date: data.createdAt?.toDate
+              ? data.createdAt.toDate().toLocaleDateString("en-IN")
+              : "Just now",
+            createdAtMs: data.createdAt?.toMillis
+              ? data.createdAt.toMillis()
+              : 0,
+          };
+        });
+
+        if (role === "coordinator") {
+          queryList.sort(
+            (a, b) => b.createdAtMs - a.createdAtMs
+          );
+        }
+
+        setQueries(queryList);
+
+        // Keep the open details view synchronized with Firestore.
+        setSelectedQuery((current) => {
+          if (!current) return null;
+
+          return (
+            queryList.find(
+              (item) =>
+                item.id === current.id &&
+                item.ownerUid === current.ownerUid
+            ) || current
+          );
+        });
+
+        setQueriesLoading(false);
+      },
+      (error) => {
+        console.error("Query loading error:", error);
+
+        if (active) {
+          setNotice(getErrorMessage(error));
+          setQueriesLoading(false);
+        }
+      }
+    );
+
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  }, [authUser, role, roleReady]);
+
+  // --------------------------------------------------
+  // ADMIN DATA
+  // --------------------------------------------------
+
+  useEffect(() => {
+    if (!authUser || !roleReady || role !== "admin") {
       return;
     }
+
+    const stopUsers = onSnapshot(
+      collection(db, "users"),
+      (snapshot) => {
+        setUsers(
+          snapshot.docs.map((item) => ({
+            uid: item.id,
+            ...item.data(),
+          }))
+        );
+      },
+      (error) => {
+        console.error("User loading error:", error);
+        setNotice(getErrorMessage(error));
+      }
+    );
+
+    const stopRules = onSnapshot(
+      doc(db, "settings", "rules"),
+      (snapshot) => {
+        setRulesText(
+          snapshot.exists()
+            ? snapshot.data().content || ""
+            : ""
+        );
+      },
+      (error) => {
+        console.error("Rules loading error:", error);
+        setNotice(getErrorMessage(error));
+      }
+    );
+
+    return () => {
+      stopUsers();
+      stopRules();
+    };
+  }, [authUser, role, roleReady]);
+
+  // --------------------------------------------------
+  // SEARCH
+  // --------------------------------------------------
+
+  const visibleQueries = useMemo(() => {
+    const searchText = search.toLowerCase().trim();
+
+    if (!searchText) return queries;
+
+    return queries.filter((item) =>
+      [
+        item.title,
+        item.category,
+        item.status,
+        item.studentEmail,
+        item.assignedEmail,
+      ].some((value) =>
+        (value || "").toLowerCase().includes(searchText)
+      )
+    );
+  }, [queries, search]);
+
+  // --------------------------------------------------
+  // LOGIN AND REGISTRATION
+  // --------------------------------------------------
+
+  async function handleAuth(event) {
+    event.preventDefault();
 
     setAuthLoading(true);
     setNotice("");
 
     try {
-      if (isRegistering) {
-        await createUserWithEmailAndPassword(
+      const cleanEmail = email.trim().toLowerCase();
+
+      if (registering) {
+        const result = await createUserWithEmailAndPassword(
           auth,
-          email.trim(),
+          cleanEmail,
           password
         );
 
-        setNotice("Account created successfully!");
+        await setDoc(doc(db, "users", result.user.uid), {
+          email: result.user.email || cleanEmail,
+          role: "student",
+          displayName: cleanEmail.split("@")[0],
+          createdAt: serverTimestamp(),
+        });
+
+        // New accounts are students by default.
+        await setDoc(doc(db, "roles", result.user.uid), {
+          role: "student",
+          createdAt: serverTimestamp(),
+        });
+
+        setNotice(
+          "Account created successfully as Student Representative."
+        );
       } else {
         await signInWithEmailAndPassword(
           auth,
-          email.trim(),
+          cleanEmail,
           password
         );
-
-        setNotice("Signed in successfully!");
       }
-
-      setPassword("");
     } catch (error) {
+      console.error("Authentication error:", error);
       setNotice(getErrorMessage(error));
     } finally {
       setAuthLoading(false);
     }
   }
 
-  // ------------------------------------
-  // FORGOT PASSWORD
-  // ------------------------------------
-
-  async function handleForgotPassword() {
+  async function forgotPassword() {
     if (!email.trim()) {
-      setNotice("Please enter your email address first.");
+      setNotice("Enter your email address first.");
       return;
     }
 
-    setAuthLoading(true);
-    setNotice("");
-
     try {
-      await sendPasswordResetEmail(auth, email.trim());
+      await sendPasswordResetEmail(
+        auth,
+        email.trim().toLowerCase()
+      );
 
       setNotice(
-        "If an account exists for this email, a password reset link has been sent."
+        "Password reset email sent if the account exists."
       );
     } catch (error) {
       setNotice(getErrorMessage(error));
-    } finally {
-      setAuthLoading(false);
     }
   }
 
-  // ------------------------------------
-  // LOGOUT
-  // ------------------------------------
-
-  async function handleLogout() {
+  async function logout() {
     try {
       await signOut(auth);
 
-      setQueries([]);
-      setPassword("");
-      setSelectedQueryId(null);
-      setActivePage("dashboard");
       setNotice("");
-    } catch {
-      setNotice("Unable to sign out. Please try again.");
+      setPassword("");
+      setSearch("");
+      setSelectedQuery(null);
+    } catch (error) {
+      setNotice(getErrorMessage(error));
     }
   }
 
-  // ------------------------------------
-  // NAVIGATION
-  // ------------------------------------
-
-  function openPage(page) {
-    setActivePage(page);
-    setSelectedQueryId(null);
-    setSearch("");
-    setNotice("");
-  }
-
-  function openQuery(id) {
-    setSelectedQueryId(id);
-    setActivePage("details");
-    setNotice("");
-  }
-
-  // ------------------------------------
-  // QUERY FORM
-  // ------------------------------------
-
-  function updateForm(event) {
-    const { name, value } = event.target;
-
-    setForm((current) => ({
-      ...current,
-      [name]: value,
-    }));
-  }
-
-  // ------------------------------------
-  // SUBMIT QUERY TO FIRESTORE
-  // ------------------------------------
+  // --------------------------------------------------
+  // STUDENT: SUBMIT QUERY
+  // --------------------------------------------------
 
   async function submitQuery(event) {
     event.preventDefault();
+
+    if (role !== "student") {
+      setNotice(
+        "Only Student Representatives can log queries."
+      );
+      return;
+    }
 
     if (!form.title.trim() || !form.description.trim()) {
       setNotice("Please complete all required fields.");
       return;
     }
 
-    if (!authUser) {
-      setNotice("Please sign in before submitting a query.");
+    if (!categories.includes(form.category)) {
+      setNotice("Please select a valid query category.");
       return;
     }
 
-    setQueriesLoading(true);
-    setNotice("");
-
     try {
-      const queriesRef = collection(
-        db,
-        "users",
-        authUser.uid,
-        "queries"
-      );
+      setQueriesLoading(true);
+      setNotice("");
 
-      await addDoc(queriesRef, {
-        title: form.title.trim(),
-        category: form.category,
-        description: form.description.trim(),
-        status: "Pending",
-        createdAt: serverTimestamp(),
-        studentEmail: authUser.email,
-      });
+      await addDoc(
+        collection(db, "users", authUser.uid, "queries"),
+        {
+          title: form.title.trim(),
+          category: form.category,
+          description: form.description.trim(),
+          status: "Pending",
+          createdAt: serverTimestamp(),
+          studentEmail: authUser.email || "",
+          assignedTo: "",
+          assignedEmail: "",
+        }
+      );
 
       setForm({
         title: "",
-        category: "Scholarship",
+        category: categories[0] || "Other",
         description: "",
       });
 
-      setNotice("Your query has been submitted successfully!");
-      setActivePage("queries");
-
-      const snapshot = await getDocs(
-        query(queriesRef, orderBy("createdAt", "desc"))
-      );
-
-      const loadedQueries = snapshot.docs.map((doc) => {
-        const data = doc.data();
-
-        return {
-          id: doc.id,
-          ownerUid: authUser.uid,
-          title: data.title,
-          category: data.category,
-          description: data.description,
-          status: data.status,
-          date: data.createdAt
-            ? data.createdAt.toDate().toLocaleDateString("en-IN")
-            : "Just now",
-          student: data.studentEmail,
-          statusUpdatedAt: data.statusUpdatedAt || null,
-        };
-      });
-
-      setQueries(loadedQueries);
+      setPage("queries");
+      setNotice("Your query has been submitted successfully.");
     } catch (error) {
-      console.error("Error submitting query:", error);
-      setNotice("Unable to submit your query. Please try again.");
+      console.error("Query submission error:", error);
+      setNotice(getErrorMessage(error));
     } finally {
       setQueriesLoading(false);
     }
   }
 
-  // ------------------------------------
-  // COORDINATOR STATUS UPDATE
-  // ------------------------------------
+  // --------------------------------------------------
+  // COORDINATOR / ADMIN: UPDATE QUERY STATUS
+  // --------------------------------------------------
 
-  async function changeStatus(queryItem, status) {
-    if (userRole !== "coordinator") {
-      setNotice("Only coordinators can update query status.");
+  async function updateStatus(item, status) {
+    if (!["coordinator", "admin"].includes(role)) {
+      return;
+    }
+
+    if (!STATUSES.includes(status)) {
+      setNotice("Invalid query status.");
       return;
     }
 
     try {
-      const queryRef = doc(
-        db,
-        "users",
-        queryItem.ownerUid,
-        "queries",
-        queryItem.id
+      await updateDoc(
+        doc(db, "users", item.ownerUid, "queries", item.id),
+        {
+          status,
+          statusUpdatedAt: serverTimestamp(),
+        }
       );
-
-      await updateDoc(queryRef, {
-        status,
-        statusUpdatedAt: serverTimestamp(),
-      });
 
       setNotice(`Query status updated to ${status}.`);
     } catch (error) {
-      console.error("Error updating query status:", error);
-
-      setNotice(
-        "Unable to update status. Check Firestore rules and try again."
-      );
+      console.error("Status update error:", error);
+      setNotice(getErrorMessage(error));
     }
   }
 
-  // ------------------------------------
-  // SPLASH / AUTH LOADING
-  // ------------------------------------
+  // --------------------------------------------------
+  // ADMIN: ASSIGN QUERY
+  // --------------------------------------------------
 
-  if (
-    showSplash ||
-    !authReady ||
-    (authUser && !roleReady)
-  ) {
+  async function assignQuery(item) {
+    if (role !== "admin" || !assignmentUid) {
+      setNotice("Select a Coordinator first.");
+      return;
+    }
+
+    const coordinator = users.find(
+      (user) => user.uid === assignmentUid
+    );
+
+    if (!coordinator || coordinator.role !== "coordinator") {
+      setNotice("Please select a valid Coordinator account.");
+      return;
+    }
+
+    try {
+      await updateDoc(
+        doc(db, "users", item.ownerUid, "queries", item.id),
+        {
+          assignedTo: coordinator.uid,
+          assignedEmail: coordinator.email || "",
+          assignedAt: serverTimestamp(),
+        }
+      );
+
+      setAssignmentUid("");
+      setNotice("Query assigned successfully.");
+    } catch (error) {
+      console.error("Query assignment error:", error);
+      setNotice(getErrorMessage(error));
+    }
+  }
+
+  // --------------------------------------------------
+  // ADMIN: CHANGE USER ROLE
+  // --------------------------------------------------
+
+  async function changeUserRole(userUid, nextRole) {
+    if (role !== "admin") return;
+
+    if (!["student", "coordinator", "admin"].includes(nextRole)) {
+      setNotice("Invalid role selected.");
+      return;
+    }
+
+    if (userUid === authUser.uid) {
+      setNotice("You cannot change your own Admin role.");
+      return;
+    }
+
+    try {
+      await setDoc(
+        doc(db, "roles", userUid),
+        {
+          role: nextRole,
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+      await setDoc(
+        doc(db, "users", userUid),
+        { role: nextRole },
+        { merge: true }
+      );
+
+      setNotice(`User role updated to ${ROLE_LABELS[nextRole]}.`);
+    } catch (error) {
+      console.error("Role update error:", error);
+      setNotice(getErrorMessage(error));
+    }
+  }
+
+  // --------------------------------------------------
+  // ADMIN: CATEGORY MANAGEMENT
+  // --------------------------------------------------
+
+  async function addCategory(event) {
+    event.preventDefault();
+
+    const name = newCategory.trim();
+
+    if (!name) {
+      setNotice("Enter a category name.");
+      return;
+    }
+
+    if (
+      categories.some(
+        (category) =>
+          category.toLowerCase() === name.toLowerCase()
+      )
+    ) {
+      setNotice("This category already exists.");
+      return;
+    }
+
+    const categoryId = name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
+
+    if (!categoryId) {
+      setNotice("Please enter a valid category name.");
+      return;
+    }
+
+    try {
+      await setDoc(doc(db, "categories", categoryId), {
+        name,
+        createdAt: serverTimestamp(),
+      });
+
+      setNewCategory("");
+      setNotice("Category added successfully.");
+    } catch (error) {
+      console.error("Category creation error:", error);
+      setNotice(getErrorMessage(error));
+    }
+  }
+
+  async function removeCategory(name) {
+    if (role !== "admin") return;
+
+    const categoryId = name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
+
+    try {
+      await deleteDoc(doc(db, "categories", categoryId));
+      setNotice("Category removed successfully.");
+    } catch (error) {
+      console.error("Category removal error:", error);
+      setNotice(getErrorMessage(error));
+    }
+  }
+
+  // --------------------------------------------------
+  // ADMIN: GUIDELINES
+  // --------------------------------------------------
+
+  async function saveRules(event) {
+    event.preventDefault();
+
+    if (role !== "admin") return;
+
+    try {
+      await setDoc(
+        doc(db, "settings", "rules"),
+        {
+          content: rulesText,
+          updatedAt: serverTimestamp(),
+          updatedBy: authUser.uid,
+        },
+        { merge: true }
+      );
+
+      setNotice("Guidelines saved successfully.");
+    } catch (error) {
+      console.error("Guidelines save error:", error);
+      setNotice(getErrorMessage(error));
+    }
+  }
+    // --------------------------------------------------
+  // LOADING SCREEN
+  // --------------------------------------------------
+
+  if (!authReady || (authUser && !roleReady)) {
     return (
       <div className="splash-screen">
         <div className="splash-content">
           <img
             src="/maatram-logo.png"
-            alt="Maatram Foundation"
+            alt="Maatram"
             className="splash-logo"
           />
-
           <h1>MAATRAM</h1>
           <p>STUDENT SUPPORT SYSTEM</p>
           <div className="splash-loader"></div>
@@ -548,15 +759,14 @@ function App() {
     );
   }
 
-  // ------------------------------------
-  // LOGIN / REGISTRATION PAGE
-  // ------------------------------------
+  // --------------------------------------------------
+  // LOGIN SCREEN
+  // --------------------------------------------------
 
   if (!authUser) {
     return (
       <div className="login-page">
         <div className="login-card">
-
           <div className="login-logo">
             <img
               src="/maatram-logo.png"
@@ -570,61 +780,52 @@ function App() {
             </span>
 
             <h2>
-              {isRegistering
+              {registering
                 ? "Create your account"
                 : "Welcome back"}
             </h2>
 
             <p>
-              {isRegistering
-                ? "Register to access student support."
-                : "Sign in to continue to your student portal."}
+              {registering
+                ? "Register as a Student Representative."
+                : "Sign in to continue to your portal."}
             </p>
           </div>
 
-          <form onSubmit={handleLogin} className="login-form">
+          <form onSubmit={handleAuth} className="login-form">
             <label htmlFor="email">Email address</label>
 
             <input
               id="email"
               type="email"
-              placeholder="Enter your email"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
+              placeholder="Enter your email"
+              autoComplete="email"
               required
             />
 
             <label htmlFor="password">Password</label>
 
-            <div className="password-field">
-              <input
-                id="password"
-                type={showPassword ? "text" : "password"}
-                placeholder="Enter your password"
-                value={password}
-                onChange={(event) => setPassword(event.target.value)}
-                minLength={6}
-                required
-              />
+            <input
+              id="password"
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              placeholder="Enter your password"
+              autoComplete={
+                registering ? "new-password" : "current-password"
+              }
+              minLength={6}
+              required
+            />
 
-              <button
-                type="button"
-                className="password-toggle"
-                onClick={() =>
-                  setShowPassword((current) => !current)
-                }
-              >
-                {showPassword ? "Hide" : "Show"}
-              </button>
-            </div>
-
-            {!isRegistering && (
+            {!registering && (
               <div className="forgot-password">
                 <button
                   type="button"
                   className="text-button"
-                  onClick={handleForgotPassword}
-                  disabled={authLoading}
+                  onClick={forgotPassword}
                 >
                   Forgot password?
                 </button>
@@ -638,180 +839,206 @@ function App() {
             >
               {authLoading
                 ? "Please wait..."
-                : isRegistering
+                : registering
                 ? "Create account"
                 : "Sign in"}
             </button>
           </form>
 
           <p className="auth-switch">
-            {isRegistering
+            {registering
               ? "Already have an account?"
               : "Don't have an account?"}
 
             <button
-              type="button"
               className="text-button"
+              type="button"
               onClick={() => {
-                setIsRegistering((current) => !current);
+                setRegistering(!registering);
                 setNotice("");
               }}
             >
-              {isRegistering ? "Sign in" : "Create account"}
+              {registering ? "Sign in" : "Create account"}
             </button>
           </p>
 
           {notice && (
-            <div className="notice-message">
-              {notice}
-            </div>
+            <div className="notice-message">{notice}</div>
           )}
 
           <div className="login-footer">
             © 2026 Maatram Foundation
           </div>
-
         </div>
       </div>
     );
   }
-    // ------------------------------------
+
+  // --------------------------------------------------
+  // ROLE-BASED DATA
+  // --------------------------------------------------
+
+  const isAdmin = role === "admin";
+  const isCoordinator = role === "coordinator";
+
+  const pending = queries.filter(
+    (item) => item.status === "Pending"
+  ).length;
+
+  const inProgress = queries.filter(
+    (item) => item.status === "In Progress"
+  ).length;
+
+  const resolved = queries.filter(
+    (item) => item.status === "Resolved"
+  ).length;
+
+  const coordinators = users.filter(
+    (user) => user.role === "coordinator"
+  );
+
+  const nav = [
+    ["dashboard", "▦", "Dashboard"],
+    [
+      "queries",
+      "☷",
+      isAdmin
+        ? "All Queries"
+        : isCoordinator
+        ? "Assigned Queries"
+        : "My Queries",
+    ],
+    ...(role === "student"
+      ? [["raise", "+", "Log a Query"]]
+      : []),
+    ...(isAdmin
+      ? [
+          ["users", "♙", "Users"],
+          ["categories", "▤", "Categories"],
+          ["rules", "⚙", "Rules"],
+          ["reports", "▥", "Reports"],
+        ]
+      : []),
+  ];
+
+  // Mobile navigation uses the same items as desktop navigation.
+  const navItems = nav.map(([id, icon, label]) => ({
+    id,
+    icon,
+    label,
+  }));
+
+  function openPage(nextPage) {
+    setPage(nextPage);
+    setSelectedQuery(null);
+    setSearch("");
+    setNotice("");
+  }
+
+  // --------------------------------------------------
   // MAIN APPLICATION
-  // ------------------------------------
+  // --------------------------------------------------
 
   return (
     <div className="app-shell">
-
       <aside className="sidebar">
-
         <div className="sidebar-brand">
           <Brand />
         </div>
 
         <div className="sidebar-user">
           <div className="user-avatar">
-            {(authUser.email || "S").charAt(0).toUpperCase()}
+            {(authUser.email || "M")[0].toUpperCase()}
           </div>
 
           <div className="user-info">
-            <strong>
-              {userRole === "coordinator" ? "Coordinator" : "Student"}
-            </strong>
+            <strong>{ROLE_LABELS[role]}</strong>
             <span>{authUser.email}</span>
           </div>
         </div>
 
         <nav className="sidebar-nav">
+          <span className="nav-label">WORKSPACE</span>
 
-          <span className="nav-label">MENU</span>
+          {nav.map(([key, icon, label]) => (
+            <button
+              key={key}
+              className={page === key ? "active" : ""}
+              onClick={() => openPage(key)}
+            >
+              <span>{icon}</span>
+              {label}
 
-          <button
-            className={activePage === "dashboard" ? "active" : ""}
-            onClick={() => openPage("dashboard")}
-          >
-            <span>▦</span>
-            Dashboard
-          </button>
-
-          {/* Raise a Query removed from sidebar */}
-
-          <button
-            className={activePage === "queries" ? "active" : ""}
-            onClick={() => openPage("queries")}
-          >
-            <span>☷</span>
-            {userRole === "coordinator"
-              ? "All Student Queries"
-              : "My Queries"}
-            <span className="nav-count">{queries.length}</span>
-          </button>
-
-          <button
-            className={activePage === "notifications" ? "active" : ""}
-            onClick={() => openPage("notifications")}
-          >
-            <span>♧</span>
-            Notifications
-          </button>
-
+              {key === "queries" && (
+                <span className="nav-count">
+                  {queries.length}
+                </span>
+              )}
+            </button>
+          ))}
         </nav>
 
         <div className="sidebar-bottom">
-
           <div className="sidebar-help">
             <span>
-              {userRole === "coordinator"
+              {isAdmin
+                ? "Administration"
+                : isCoordinator
                 ? "Coordinator workspace"
                 : "Need assistance?"}
             </span>
 
             <p>
-              {userRole === "coordinator"
-                ? "Review student requests and update their progress."
-                : "Raise a query and our team will help you."}
+              {isAdmin
+                ? "Manage users, categories, guidelines and reports."
+                : isCoordinator
+                ? "Work on queries assigned to you."
+                : "Log a query and track its progress."}
             </p>
-
-            <button
-              onClick={() =>
-                openPage(
-                  userRole === "coordinator"
-                    ? "queries"
-                    : "raise"
-                )
-              }
-            >
-              {userRole === "coordinator"
-                ? "Review Queries →"
-                : "Get Support →"}
-            </button>
           </div>
 
-          <button
-            className="logout-button"
-            onClick={handleLogout}
-          >
+          <button className="logout-button" onClick={logout}>
             <span>↪</span>
             Sign out
           </button>
-
         </div>
-
       </aside>
 
       <main className="main-content">
-
         <header className="topbar">
-
           <div>
             <span className="topbar-label">
               MAATRAM FOUNDATION
             </span>
 
             <h2>
-              {activePage === "dashboard" && "Dashboard"}
-              {activePage === "raise" && "Raise a Query"}
-              {activePage === "queries" &&
-                (userRole === "coordinator"
-                  ? "All Student Queries"
-                  : "My Queries")}
-              {activePage === "details" && "Query Details"}
-              {activePage === "notifications" && "Notifications"}
+              {{
+                dashboard: "Dashboard",
+                queries: isAdmin
+                  ? "All Queries"
+                  : isCoordinator
+                  ? "Assigned Queries"
+                  : "My Queries",
+                raise: "Log a Query",
+                users: "User Management",
+                categories: "Category Management",
+                rules: "Guidelines & Rules",
+                reports: "Reports",
+                details: "Query Details",
+              }[page] || "Dashboard"}
             </h2>
           </div>
 
           <div className="topbar-user">
-
             <div className="topbar-user-info">
-              <strong>Welcome back!</strong>
+              <strong>{ROLE_LABELS[role]}</strong>
               <span>{authUser.email}</span>
             </div>
 
             <div className="user-avatar">
-              {(authUser.email || "S").charAt(0).toUpperCase()}
+              {(authUser.email || "M")[0].toUpperCase()}
             </div>
-
           </div>
-
         </header>
 
         {notice && (
@@ -823,46 +1050,43 @@ function App() {
 
         {/* DASHBOARD */}
 
-        {activePage === "dashboard" && (
+        {page === "dashboard" && (
           <section className="page-content">
-
             <div className="welcome-banner">
               <div>
                 <span className="eyebrow">
-                  {userRole === "coordinator"
-                    ? "COORDINATOR PORTAL"
-                    : "STUDENT PORTAL"}
+                  {ROLE_LABELS[role].toUpperCase()} PORTAL
                 </span>
 
                 <h1>
-                  Hello,{" "}
-                  <span>
-                    {userRole === "coordinator"
-                      ? "Coordinator!"
-                      : "Student!"}
-                  </span>
+                  Hello, <span>{ROLE_LABELS[role]}!</span>
                 </h1>
 
                 <p>
-                  {userRole === "coordinator"
-                    ? "Review student requests and help them move forward."
-                    : "Your journey matters. Let us know how we can support you."}
+                  {isAdmin
+                    ? "Manage the student support system from one place."
+                    : isCoordinator
+                    ? "Review and resolve the queries assigned to you."
+                    : "Log your support requests and follow their progress."}
                 </p>
 
-                <button
-                  className="primary-button"
-                  onClick={() =>
-                    openPage(
-                      userRole === "coordinator"
-                        ? "queries"
-                        : "raise"
-                    )
-                  }
-                >
-                  {userRole === "coordinator"
-                    ? "View All Queries"
-                    : "+ Raise a Query"}
-                </button>
+                {role === "student" && (
+                  <button
+                    className="primary-button"
+                    onClick={() => openPage("raise")}
+                  >
+                    + Log a Query
+                  </button>
+                )}
+
+                {isCoordinator && (
+                  <button
+                    className="primary-button"
+                    onClick={() => openPage("queries")}
+                  >
+                    View Assigned Queries
+                  </button>
+                )}
               </div>
 
               <div className="welcome-decoration">M</div>
@@ -872,57 +1096,71 @@ function App() {
               <div>
                 <h3>Overview</h3>
                 <p>
-                  {userRole === "coordinator"
-                    ? "Overview of all student support requests."
-                    : "Here is a summary of your support requests."}
+                  {isAdmin
+                    ? "System-wide query overview."
+                    : isCoordinator
+                    ? "Your assigned workload."
+                    : "Your submitted support requests."}
                 </p>
               </div>
             </div>
 
             <div className="stats-grid">
-
-              <StatCard
+              <Stat
                 title="Total Queries"
                 value={queries.length}
                 icon="☷"
-                description="All submitted queries"
               />
 
-              <StatCard
+              <Stat
                 title="Pending"
-                value={pendingCount}
+                value={pending}
                 icon="◷"
-                description="Waiting for review"
               />
 
-              <StatCard
+              <Stat
                 title="In Progress"
-                value={progressCount}
+                value={inProgress}
                 icon="↻"
-                description="Currently being handled"
               />
 
-              <StatCard
+              <Stat
                 title="Resolved"
-                value={resolvedCount}
+                value={resolved}
                 icon="✓"
-                description="Successfully completed"
               />
-
             </div>
+
+            {isAdmin && (
+              <div className="admin-shortcuts">
+                {[
+                  ["users", "Manage Users"],
+                  ["categories", "Manage Categories"],
+                  ["rules", "Manage Rules"],
+                  ["reports", "View Reports"],
+                ].map(([target, label]) => (
+                  <button
+                    className="secondary-button"
+                    key={target}
+                    onClick={() => openPage(target)}
+                  >
+                    {label} →
+                  </button>
+                ))}
+              </div>
+            )}
 
             <div className="section-heading">
               <div>
                 <h3>
-                  {userRole === "coordinator"
-                    ? "Recent Student Queries"
+                  {isAdmin
+                    ? "Latest Queries"
+                    : isCoordinator
+                    ? "Assigned Queries"
                     : "Recent Queries"}
                 </h3>
-                <p>
-                  {userRole === "coordinator"
-                    ? "Latest requests submitted by students."
-                    : "Track your latest support requests."}
-                </p>
+
+                <p>Latest query activity</p>
               </div>
 
               <button
@@ -935,58 +1173,67 @@ function App() {
 
             {queriesLoading ? (
               <div className="empty-state">
-                <p>Loading your queries...</p>
+                Loading queries...
               </div>
             ) : (
               <QueryList
-                queries={queries.slice(0, 4)}
-                onOpen={openQuery}
-                showStudent={userRole === "coordinator"}
+                queries={queries.slice(0, 5)}
+                onSelect={(item) => {
+                  setSelectedQuery(item);
+                  setPage("details");
+                }}
               />
             )}
-
           </section>
         )}
 
-        {/* RAISE QUERY */}
+        {/* STUDENT: LOG QUERY */}
 
-        {activePage === "raise" && userRole !== "coordinator" && (
+        {page === "raise" && role === "student" && (
           <section className="page-content">
-
             <div className="page-intro">
-              <span className="eyebrow">WE ARE HERE TO HELP</span>
-              <h1>Raise a Query</h1>
+              <span className="eyebrow">
+                WE ARE HERE TO HELP
+              </span>
+              <h1>Log a Query</h1>
               <p>
-                Tell us what you need help with. Our support team will review your request.
+                Submit a support request for the Maatram team.
               </p>
             </div>
 
-            <form className="query-form" onSubmit={submitQuery}>
-
+            <form
+              className="query-form"
+              onSubmit={submitQuery}
+            >
               <div className="form-section-heading">
                 <h3>Query Information</h3>
-                <p>Fields marked with * are required.</p>
+                <p>Fields marked * are required.</p>
               </div>
 
-              <label htmlFor="query-title">Query Title *</label>
+              <label>Query Title *</label>
 
               <input
-                id="query-title"
-                name="title"
-                type="text"
-                placeholder="Enter a short title for your query"
                 value={form.title}
-                onChange={updateForm}
+                onChange={(event) =>
+                  setForm((previous) => ({
+                    ...previous,
+                    title: event.target.value,
+                  }))
+                }
                 required
+                placeholder="Enter a short title"
               />
 
-              <label htmlFor="query-category">Category *</label>
+              <label>Category *</label>
 
               <select
-                id="query-category"
-                name="category"
                 value={form.category}
-                onChange={updateForm}
+                onChange={(event) =>
+                  setForm((previous) => ({
+                    ...previous,
+                    category: event.target.value,
+                  }))
+                }
                 required
               >
                 {categories.map((category) => (
@@ -996,27 +1243,29 @@ function App() {
                 ))}
               </select>
 
-              <label htmlFor="query-description">
-                Describe your concern *
-              </label>
+              <label>Description *</label>
 
               <textarea
-                id="query-description"
-                name="description"
-                placeholder="Explain your issue in detail..."
-                value={form.description}
-                onChange={updateForm}
                 rows={6}
+                value={form.description}
+                onChange={(event) =>
+                  setForm((previous) => ({
+                    ...previous,
+                    description: event.target.value,
+                  }))
+                }
                 required
+                placeholder="Explain your concern in detail..."
               />
 
               <div className="upload-area">
-                <p>Image attachments are temporarily unavailable.</p>
-                <span>Text-based query submission is available.</span>
+                <p>Image attachments are not enabled yet.</p>
+                <span>
+                  Text-based query submission is available.
+                </span>
               </div>
 
               <div className="form-actions">
-
                 <button
                   type="button"
                   className="secondary-button"
@@ -1034,412 +1283,500 @@ function App() {
                     ? "Submitting..."
                     : "Submit Query →"}
                 </button>
-
               </div>
-
             </form>
-
           </section>
         )}
+                {/* ALL QUERIES PAGE */}
 
-        {/* MY QUERIES / ALL STUDENT QUERIES */}
-
-        {activePage === "queries" && (
+        {page === "queries" && (
           <section className="page-content">
-
             <div className="page-intro">
-              <span className="eyebrow">YOUR SUPPORT REQUESTS</span>
-
+              <span className="eyebrow">QUERY MANAGEMENT</span>
               <h1>
-                {userRole === "coordinator"
-                  ? "All Student Queries"
+                {isAdmin
+                  ? "All Queries"
+                  : isCoordinator
+                  ? "Assigned Queries"
                   : "My Queries"}
               </h1>
-
-              <p>
-                {userRole === "coordinator"
-                  ? "Review and manage queries submitted by students."
-                  : "View and track the progress of your submitted queries."}
-              </p>
+              <p>View and track student support requests.</p>
             </div>
 
-            <div className="query-toolbar">
-
+            <div className="filter-bar">
               <input
-                type="search"
-                placeholder={
-                  userRole === "coordinator"
-                    ? "Search student queries..."
-                    : "Search your queries..."
-                }
+                type="text"
+                placeholder="Search queries..."
                 value={search}
-                onChange={(event) =>
-                  setSearch(event.target.value)
-                }
+                onChange={(event) => setSearch(event.target.value)}
               />
-
-              <span>{filteredQueries.length} queries found</span>
-
             </div>
 
             {queriesLoading ? (
-              <div className="empty-state">
-                <p>Loading your queries...</p>
-              </div>
+              <p className="empty-state">Loading queries...</p>
+            ) : visibleQueries.length === 0 ? (
+              <p className="empty-state">No queries found.</p>
             ) : (
               <QueryList
-                queries={filteredQueries}
-                onOpen={openQuery}
-                showStudent={userRole === "coordinator"}
+                queries={visibleQueries}
+                onSelect={(item) => {
+                  setSelectedQuery(item);
+                  setPage("details");
+                }}
               />
             )}
-
           </section>
         )}
 
-        {/* QUERY DETAILS */}
+        {/* QUERY DETAILS PAGE */}
 
-        {activePage === "details" && (
+        {page === "details" && selectedQuery && (
           <section className="page-content">
+            <button
+              className="back-button"
+              onClick={() => setPage("queries")}
+            >
+              ← Back to Queries
+            </button>
 
-            {selectedQuery ? (
-              <div className="details-card">
-
-                {/* IMPROVED GOLD BACK BUTTON */}
-
-                <button
-                  className="secondary-button back-button"
-                  onClick={() => openPage("queries")}
-                >
-                  ← Back to{" "}
-                  {userRole === "coordinator"
-                    ? "All Student Queries"
-                    : "My Queries"}
-                </button>
-
-                <div className="details-header">
-                  <div>
-                    <span className="eyebrow">QUERY DETAILS</span>
-                    <h1>{selectedQuery.title}</h1>
-                    <p>Submitted on {selectedQuery.date}</p>
-                  </div>
-
-                  <StatusBadge status={selectedQuery.status} />
-                </div>
-
-                <div className="details-info-grid">
-
-                  <div>
-                    <span>Category</span>
-                    <strong>{selectedQuery.category}</strong>
-                  </div>
-
-                  <div>
-                    <span>Submitted by</span>
-                    <strong>{selectedQuery.student}</strong>
-                  </div>
-
-                  <div>
-                    <span>Query ID</span>
-                    <strong>#{selectedQuery.id}</strong>
-                  </div>
-
-                </div>
-
-                <div className="details-description">
-                  <h3>Description</h3>
-                  <p>{selectedQuery.description}</p>
-                </div>
-
-                <div className="details-status">
-                  <h3>Current Status</h3>
-
-                  <StatusBadge status={selectedQuery.status} />
-
-                  <p>
-                    You can check this page to follow the progress of your request.
-                  </p>
-                </div>
-
-                {userRole === "coordinator" && (
-                  <div className="demo-status-controls">
-
-                    <h3>Update Query Status</h3>
-
-                    <p>
-                      Choose the latest status. The change will be saved to Firestore.
-                    </p>
-
-                    <div className="status-buttons">
-
-                      {[
-                        "Pending",
-                        "In Progress",
-                        "Resolved",
-                      ].map((status) => (
-                        <button
-                          key={status}
-                          type="button"
-                          className="secondary-button"
-                          disabled={selectedQuery.status === status}
-                          onClick={() =>
-                            changeStatus(selectedQuery, status)
-                          }
-                        >
-                          {selectedQuery.status === status
-                            ? `✓ ${status}`
-                            : status}
-                        </button>
-                      ))}
-
-                    </div>
-                  </div>
-                )}
-
+            <div className="page-heading">
+              <div>
+                <h2>Query Details</h2>
+                <p>
+                  Review the request and its current progress.
+                </p>
               </div>
-            ) : (
-              <div className="empty-state">
-                <h3>Query not found</h3>
 
-                <button
-                  className="primary-button"
-                  onClick={() => openPage("queries")}
-                >
-                  Back to{" "}
-                  {userRole === "coordinator"
-                    ? "All Student Queries"
-                    : "My Queries"}
-                </button>
+              <Status status={selectedQuery.status} />
+            </div>
+
+            <div className="details-card">
+              <div className="detail-row">
+                <span>Query Title</span>
+                <strong>{selectedQuery.title}</strong>
               </div>
-            )}
 
+              <div className="detail-row">
+                <span>Category</span>
+                <strong>{selectedQuery.category}</strong>
+              </div>
+
+              <div className="detail-row">
+                <span>Student Email</span>
+                <strong>
+                  {selectedQuery.studentEmail || "Not available"}
+                </strong>
+              </div>
+
+              <div className="detail-row">
+                <span>Submitted On</span>
+                <strong>
+                  {selectedQuery.createdAt?.toDate
+                    ? selectedQuery.createdAt
+                        .toDate()
+                        .toLocaleString("en-IN")
+                    : "Not available"}
+                </strong>
+              </div>
+
+              <div className="detail-description">
+                <span>Description</span>
+                <p>{selectedQuery.description}</p>
+              </div>
+
+              <div className="detail-row">
+                <span>Assigned Coordinator</span>
+                <strong>
+                  {selectedQuery.assignedEmail || "Not assigned"}
+                </strong>
+              </div>
+
+              {isAdmin && (
+                <div className="management-section">
+                  <h3>Assign Coordinator</h3>
+
+                  <select
+                    value={assignmentUid}
+                    onChange={(event) =>
+                      setAssignmentUid(event.target.value)
+                    }
+                  >
+                    <option value="">Select coordinator</option>
+
+                    {coordinators.map((coordinator) => (
+                      <option
+                        key={coordinator.uid}
+                        value={coordinator.uid}
+                      >
+                        {coordinator.displayName ||
+                          coordinator.email}
+                      </option>
+                    ))}
+                  </select>
+
+                  <button
+                    className="primary-button"
+                    onClick={() => assignQuery(selectedQuery)}
+                    disabled={!assignmentUid}
+                  >
+                    Assign Coordinator
+                  </button>
+                </div>
+              )}
+
+              {(isAdmin || isCoordinator) && (
+                <div className="management-section">
+                  <h3>Update Query Status</h3>
+
+                  <div className="status-actions">
+                    {STATUSES.map((status) => (
+                      <button
+                        key={status}
+                        className={
+                          selectedQuery.status === status
+                            ? "status-button active"
+                            : "status-button"
+                        }
+                        onClick={() =>
+                          updateStatus(selectedQuery, status)
+                        }
+                        disabled={selectedQuery.status === status}
+                      >
+                        {status}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
           </section>
         )}
-                {/* NOTIFICATIONS */}
 
-        {activePage === "notifications" && (
+        {/* ADMIN USER MANAGEMENT */}
+
+        {page === "users" && isAdmin && (
           <section className="page-content">
-
             <div className="page-intro">
-              <span className="eyebrow">STAY UPDATED</span>
-              <h1>Notifications</h1>
+              <span className="eyebrow">ADMINISTRATION</span>
+              <h1>User Management</h1>
+              <p>Manage student and coordinator accounts.</p>
+            </div>
+
+            <div className="table-container">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Name</th>
+                    <th>Email</th>
+                    <th>Current Role</th>
+                    <th>Change Role</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {users.map((user) => (
+                    <tr key={user.uid}>
+                      <td>{user.displayName || "User"}</td>
+                      <td>{user.email}</td>
+                      <td>
+                        {ROLE_LABELS[user.role] || user.role}
+                      </td>
+                      <td>
+                        <select
+                          value={user.role || "student"}
+                          onChange={(event) =>
+                            changeUserRole(
+                              user.uid,
+                              event.target.value
+                            )
+                          }
+                          disabled={user.uid === authUser.uid}
+                        >
+                          <option value="student">Student</option>
+                          <option value="coordinator">
+                            Coordinator
+                          </option>
+                          <option value="admin">Admin</option>
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+
+                  {users.length === 0 && (
+                    <tr>
+                      <td colSpan="4">No users found.</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
+
+        {/* ADMIN CATEGORY MANAGEMENT */}
+
+        {page === "categories" && isAdmin && (
+          <section className="page-content">
+            <div className="page-intro">
+              <span className="eyebrow">ADMINISTRATION</span>
+              <h1>Query Categories</h1>
               <p>
-                Updates and information about your support requests.
+                Manage the categories students can select.
               </p>
             </div>
 
-            <div className="notification-list">
+            <div className="management-card">
+              <h3>Add New Category</h3>
 
-              <div className="notification-item">
-                <div className="notification-icon">✓</div>
+              <form onSubmit={addCategory} className="inline-form">
+                <input
+                  type="text"
+                  placeholder="Enter category name"
+                  value={newCategory}
+                  onChange={(event) =>
+                    setNewCategory(event.target.value)
+                  }
+                  required
+                />
 
-                <div>
-                  <strong>
-                    Welcome to Maatram Student Support!
-                  </strong>
-
-                  <p>
-                    Your account is ready. You can now raise queries and access the student support portal.
-                  </p>
-
-                  <span>Welcome</span>
-                </div>
-              </div>
-
-              {queries
-                .filter((queryItem) => queryItem.statusUpdatedAt)
-                .map((queryItem) => (
-                  <button
-                    key={`${queryItem.ownerUid}-${queryItem.id}`}
-                    className="notification-item notification-button"
-                    onClick={() => openQuery(queryItem.id)}
-                  >
-                    <div className="notification-icon">✓</div>
-
-                    <div>
-                      <strong>
-                        Status updated: {queryItem.title}
-                      </strong>
-
-                      <p>
-                        Your query is now {queryItem.status}.
-                      </p>
-
-                      <span>
-                        {queryItem.statusUpdatedAt?.toDate
-                          ? queryItem.statusUpdatedAt
-                              .toDate()
-                              .toLocaleString("en-IN")
-                          : "Recently updated"}
-                      </span>
-                    </div>
-                  </button>
-                ))}
-
+                <button
+                  type="submit"
+                  className="primary-button"
+                  disabled={!newCategory.trim()}
+                >
+                  Add Category
+                </button>
+              </form>
             </div>
 
+            <div className="category-list">
+              {categories.map((category) => (
+                <div className="category-item" key={category}>
+                  <span>{category}</span>
+
+                  <button
+                    className="danger-button"
+                    onClick={() => removeCategory(category)}
+                  >
+                    Remove
+                  </button>
+                </div>
+              ))}
+
+              {categories.length === 0 && (
+                <p className="empty-state">
+                  No categories available.
+                </p>
+              )}
+            </div>
           </section>
         )}
 
-        <footer className="main-footer">
-          <span>© 2026 Maatram Foundation</span>
-          <span>Student Support System</span>
-        </footer>
+        {/* ADMIN GUIDELINES PAGE */}
 
+        {page === "rules" && isAdmin && (
+          <section className="page-content">
+            <div className="page-intro">
+              <span className="eyebrow">ADMINISTRATION</span>
+              <h1>Guidelines</h1>
+              <p>
+                Manage the instructions displayed to students.
+              </p>
+            </div>
+
+            <form
+              className="management-card"
+              onSubmit={saveRules}
+            >
+              <h3>Student Support Guidelines</h3>
+
+              <textarea
+                rows={8}
+                placeholder="Enter student support guidelines..."
+                value={rulesText}
+                onChange={(event) =>
+                  setRulesText(event.target.value)
+                }
+              />
+
+              <button
+                type="submit"
+                className="primary-button"
+              >
+                Save Guidelines
+              </button>
+            </form>
+          </section>
+        )}
+                {/* ADMIN REPORTS PAGE */}
+
+        {page === "reports" && isAdmin && (
+          <section className="page-content">
+            <div className="page-intro">
+              <span className="eyebrow">ADMINISTRATION</span>
+              <h1>Reports & Analytics</h1>
+              <p>
+                Overview of student support requests.
+              </p>
+            </div>
+
+            <div className="stats-grid">
+              <Stat
+                title="Total Queries"
+                value={queries.length}
+                icon="☷"
+              />
+
+              <Stat
+                title="Pending"
+                value={pending}
+                icon="◷"
+              />
+
+              <Stat
+                title="In Progress"
+                value={inProgress}
+                icon="↻"
+              />
+
+              <Stat
+                title="Resolved"
+                value={resolved}
+                icon="✓"
+              />
+            </div>
+
+            <div className="management-card">
+              <h3>Query Category Summary</h3>
+
+              {categories.map((category) => {
+                const count = queries.filter(
+                  (item) => item.category === category
+                ).length;
+
+                return (
+                  <div className="report-row" key={category}>
+                    <span>{category}</span>
+                    <strong>{count}</strong>
+                  </div>
+                );
+              })}
+
+              {categories.length === 0 && (
+                <p className="empty-state">
+                  No category data available.
+                </p>
+              )}
+            </div>
+          </section>
+        )}
       </main>
 
       {/* MOBILE NAVIGATION */}
 
       <nav className="mobile-nav">
-
-        <button
-          className={activePage === "dashboard" ? "active" : ""}
-          onClick={() => openPage("dashboard")}
-        >
-          <span>▦</span>
-          Home
-        </button>
-
-        {/* Raise button removed from mobile navigation */}
-
-        <button
-          className={activePage === "queries" ? "active" : ""}
-          onClick={() => openPage("queries")}
-        >
-          <span>☷</span>
-          Queries
-        </button>
-
-        <button
-          className={activePage === "notifications" ? "active" : ""}
-          onClick={() => openPage("notifications")}
-        >
-          <span>♧</span>
-          Alerts
-        </button>
-
+        {navItems.map((item) => (
+          <button
+            key={item.id}
+            className={
+              page === item.id
+                ? "mobile-nav-item active"
+                : "mobile-nav-item"
+            }
+            onClick={() => openPage(item.id)}
+          >
+            <span>{item.icon}</span>
+            <small>{item.label}</small>
+          </button>
+        ))}
       </nav>
-
     </div>
   );
 }
 
-// ------------------------------------
-// BRAND COMPONENT
-// ------------------------------------
+// ==================================================
+// REUSABLE COMPONENTS
+// ==================================================
 
 function Brand() {
   return (
     <div className="brand">
-      <img src="/maatram-logo.png" alt="Maatram logo" />
+      <div className="brand-logo">M</div>
 
-      <div>
+      <div className="brand-text">
         <strong>MAATRAM</strong>
-        <span>STUDENT SUPPORT</span>
+        <span>FOUNDATION</span>
       </div>
     </div>
   );
 }
 
-// ------------------------------------
-// STAT CARD
-// ------------------------------------
-
-function StatCard({ title, value, icon, description }) {
+function Stat({ title, label, value, icon }) {
   return (
     <div className="stat-card">
-
-      <div className="stat-card-top">
-        <span>{title}</span>
-
-        <div className="stat-icon">
-          {icon}
-        </div>
-      </div>
-
-      <h2>{value}</h2>
-      <p>{description}</p>
-
+      {icon && <span className="stat-icon">{icon}</span>}
+      <span>{title || label}</span>
+      <strong>{value}</strong>
     </div>
   );
 }
 
-// ------------------------------------
-// STATUS BADGE
-// ------------------------------------
-
-function StatusBadge({ status }) {
-  const className = status
+function Status({ status }) {
+  const statusClass = (status || "Pending")
     .toLowerCase()
-    .replaceAll(" ", "-");
+    .replace(/\s+/g, "-");
 
   return (
-    <span className={`status-badge ${className}`}>
-      {status}
+    <span className={`status-badge ${statusClass}`}>
+      {status || "Pending"}
     </span>
   );
 }
 
-// ------------------------------------
-// QUERY LIST
-// ------------------------------------
-
-function QueryList({
-  queries,
-  onOpen,
-  showStudent = false,
-}) {
-  if (!queries.length) {
+function QueryList({ queries, onSelect }) {
+  if (!queries || queries.length === 0) {
     return (
-      <div className="empty-state">
-        <div className="empty-icon">☷</div>
-
-        <h3>No queries found</h3>
-
-        <p>
-          {showStudent
-            ? "Student queries will appear here."
-            : "Your submitted queries will appear here."}
-        </p>
-      </div>
+      <p className="empty-state">
+        No queries available.
+      </p>
     );
   }
 
   return (
     <div className="query-list">
-
-      {queries.map((queryItem) => (
+      {queries.map((item) => (
         <button
-          key={`${queryItem.ownerUid || ""}-${queryItem.id}`}
-          className="query-list-item"
-          onClick={() => onOpen(queryItem.id)}
+          type="button"
+          className="query-card"
+          key={`${item.ownerUid}-${item.id}`}
+          onClick={() => onSelect(item)}
         >
-
-          <div className="query-list-main">
-
-            <div className="query-list-icon">☷</div>
-
-            <div className="query-list-text">
-              <strong>{queryItem.title}</strong>
-
-              <span>
-                {queryItem.category} · {queryItem.date}
-                {showStudent
-                  ? ` · ${queryItem.student}`
-                  : ""}
-              </span>
+          <div className="query-card-content">
+            <div className="query-card-heading">
+              <h3>{item.title}</h3>
+              <Status status={item.status} />
             </div>
 
-          </div>
+            <p>{item.description}</p>
 
-          <div className="query-list-right">
-            <StatusBadge status={queryItem.status} />
-            <span className="query-arrow">→</span>
-          </div>
+            <div className="query-card-meta">
+              <span>{item.category}</span>
 
+              {item.studentEmail && (
+                <span>{item.studentEmail}</span>
+              )}
+
+              <span>
+                {item.createdAt?.toDate
+                  ? item.createdAt
+                      .toDate()
+                      .toLocaleDateString("en-IN")
+                  : "Recently submitted"}
+              </span>
+            </div>
+          </div>
         </button>
       ))}
-
     </div>
   );
 }
